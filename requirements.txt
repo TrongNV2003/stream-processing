@@ -1,0 +1,13 @@
+fastapi==0.115.11
+kafka_python==2.1.2
+loguru==0.7.3
+numpy==2.2.4
+onnxruntime==1.20.1
+pymongo==4.11.3
+Requests==2.32.3
+scikit_learn==1.6.1
+torch==2.5.1+cu121
+tqdm==4.67.1
+transformers==4.47.0
+uvicorn==0.34.0
+prometheus_client
