@@ -7,6 +7,7 @@ load_dotenv()
 class AttackModelConfig(BaseSettings):
     onnx_model_path: str = Field(..., alias="ATTACK_MODEL_PATH")
     tokenizer_path: str = Field(..., alias="ATTACK_TOKENIZER_PATH")
+    pytorch_model_path: str = Field(..., alias="PYTORCH_MODEL_PATH")
 
 class KafkaConfig(BaseSettings):
     kafka_service: str = Field(..., alias="KAFKA_BOOTSTRAP_SERVERS")

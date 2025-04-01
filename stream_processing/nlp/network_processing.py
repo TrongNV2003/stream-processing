@@ -3,9 +3,9 @@ import torch
 import onnxruntime
 import pandas as pd
 from typing import List
-from transformers import AutoTokenizer
 from datetime import datetime, timezone
 from prometheus_client import Counter, Histogram
+from transformers import AutoTokenizer, AutoModelForSequenceClassification
 
 from stream_processing.setting.constants import ATTACKID2LABEL
 from stream_processing.logging.logging_monitor import AppLogger
@@ -33,18 +33,31 @@ def build_context(data: dict, sep_token: str) -> str:
     return sep_token.join(context_parts)
 
 class NetworkInferenceProcessor:
-    def __init__(self):
+    def __init__(self, use_torch=False):
         # Prometheus scrape tại port 8000
         self.message_counter = Counter('processed_messages_total', 'Total messages processed')
         self.latency_histogram = Histogram('processing_latency_seconds', 'Latency of processing messages')
         self.attack_counter = Counter('detected_attacks_total', 'Total detected attacks')
 
         self.tokenizer = AutoTokenizer.from_pretrained(attack_model_config.tokenizer_path)
-        self.session = onnxruntime.InferenceSession(
-            attack_model_config.onnx_model_path,
-            providers=["CUDAExecutionProvider"] if torch.cuda.is_available() else ["CPUExecutionProvider"]
-        )
-        self.sess_output = [out.name for out in self.session.get_outputs()]
+        self.use_torch = use_torch
+        
+        if self.use_torch:
+            self.model = AutoModelForSequenceClassification.from_pretrained(
+                attack_model_config.pytorch_model_path,
+                num_labels=len(ATTACKID2LABEL)
+            )
+            
+            self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+            self.model.to(self.device)
+            self.model.eval()
+        
+        else:
+            self.session = onnxruntime.InferenceSession(
+                attack_model_config.onnx_model_path,
+                providers=["CUDAExecutionProvider"] if torch.cuda.is_available() else ["CPUExecutionProvider"]
+            )
+            self.sess_output = [out.name for out in self.session.get_outputs()]
         
         self.consumer = create_consumer(kafka_config.raw_data_topic, group_id="network_inference_group") 
         self.producer = KafkaProducerWrapper()
@@ -64,7 +77,7 @@ class NetworkInferenceProcessor:
         
         app_logger.flush()
         
-    def _process_query(self, input_text: List[tuple], data: dict):
+    def _process_query(self, input_text: str, data: dict):
         trace = app_logger.start_trace(f"{data.get('id', 'unknown')}")
             
         # Observation 1: Ghi dữ liệu đầu vào
@@ -83,27 +96,39 @@ class NetworkInferenceProcessor:
             max_length=512,
             return_tensors="pt"
         )
-        sess_input = {
-            "input_ids": inputs["input_ids"].cpu().numpy(),
-            "attention_mask": inputs["attention_mask"].cpu().numpy()
-        }
+        
+        if self.use_torch:
+            inputs = {k: v.to(self.device) for k, v in inputs.items()}
+            with torch.no_grad():
+                outputs = self.model(**inputs)
+                logits = outputs.logits
+                
+            preds = torch.argmax(logits, dim=1).cpu().numpy().tolist()
+            confidence = torch.softmax(logits, dim=1)[0, preds[0]].item()
+        
+        else:   
+            sess_input = {
+                "input_ids": inputs["input_ids"].cpu().numpy(),
+                "attention_mask": inputs["attention_mask"].cpu().numpy()
+            }
 
-        outputs = self.session.run(self.sess_output, sess_input)
-        logits = torch.from_numpy(outputs[0])
-        preds = torch.argmax(logits, dim=1).cpu().numpy().tolist()
-        predicted_label = ATTACKID2LABEL[preds[0]]
-        confidence = torch.softmax(logits, dim=1)[0, preds[0]].item()
+            outputs = self.session.run(self.sess_output, sess_input)
+            logits = torch.from_numpy(outputs[0])
+            preds = torch.argmax(logits, dim=1).cpu().numpy().tolist()
+            confidence = torch.softmax(logits, dim=1)[0, preds[0]].item()
         
         end_time = time.time()
         latency = end_time - start_time
-
         self.latency_histogram.observe(latency)
+        latency_ms = latency * 1000
+        
         self.message_counter.inc()
 
-        latency_ms = latency * 1000
         start_time_iso = datetime.fromtimestamp(start_time).isoformat()
         end_time_iso = datetime.fromtimestamp(end_time).isoformat()
 
+        predicted_label = ATTACKID2LABEL[preds[0]]
+        
         result = {
             "id": data.get("id"),
             "timestamp": datetime.now(timezone.utc).isoformat(),
@@ -143,15 +168,12 @@ class NetworkInferenceProcessor:
             generation_id=processed_gen.id
         )
 
-        attack_labels = ["DDoS attacks", "DoS attacks", "Bot"]
-        
         if result["predicted_label"] in attack_labels:
             app_logger.log(
                 f"Detected attack - ID: {result['id']}, Confidence: {result['confidence']}",
                 level="warning",
                 trace=trace
             )
-
             trace.event(
                 name="attack_alert",
                 input=result["raw_data"],

@@ -15,7 +15,7 @@ app_logger = AppLogger.get_instance()
 
 def start_network_processor():
     try:
-        processor = NetworkInferenceProcessor()
+        processor = NetworkInferenceProcessor(use_torch=True)
         logger.info("Starting Network Inference Processor...")
         processor.process_stream()
     except Exception as e:
