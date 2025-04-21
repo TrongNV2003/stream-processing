@@ -1,5 +1,5 @@
 import asyncio
-from fastapi import FastAPI, HTTPException, Depends, BackgroundTasks
+from fastapi import FastAPI, HTTPException, Depends, BackgroundTasks, File, UploadFile
 
 from stream_processing.setting.config import kafka_config
 from stream_processing.db.connection import DatabaseHandler
@@ -19,10 +19,19 @@ async def ingest_in_background(content: bytes):
 
 @app.post("/ingest")
 async def ingest(background_tasks: BackgroundTasks):
-    with open("stream_processing/data_test_stream/test_dataset.csv", "rb") as file:
+    with open("stream_processing/data_test_stream/dataset.csv", "rb") as file:
         content = file.read()
         
     background_tasks.add_task(ingest_in_background, content) # Chạy trong background
+    return {"status": "success", "message": "Record network traffic to Kafka"}
+
+@app.post("/ingest/upload")
+async def ingest_upload(file: UploadFile = File(...), background_tasks: BackgroundTasks = BackgroundTasks()):
+    if not file.filename.endswith(".csv"):
+        raise HTTPException(status_code=400, detail="Only csv files are supported")
+    
+    content = await file.read()
+    background_tasks.add_task(ingest_in_background, content)
     return {"status": "success", "message": "Record network traffic to Kafka"}
 
 @app.get("/results")

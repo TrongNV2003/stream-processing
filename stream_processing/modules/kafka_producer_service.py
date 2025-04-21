@@ -11,10 +11,10 @@ class KafkaProducerService:
     def __init__(self, producer: KafkaProducerWrapper = None):
         self.producer = producer or KafkaProducerWrapper()
 
-    async def ingest_data(self, topic: str, csv_content: bytes):
+    async def ingest_data(self, topic: str, file_content: bytes):
         """Gửi dữ liệu lên Kafka"""
         from io import StringIO
-        queries = pd.read_csv(StringIO(csv_content.decode('utf-8')))
+        queries = pd.read_csv(StringIO(file_content.decode('utf-8')))
         for _, row in queries.iterrows():
             data = row.to_dict()
             await self._send_query(topic, data)
