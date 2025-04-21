@@ -12,7 +12,7 @@ class KafkaProducerService:
         self.producer = producer or KafkaProducerWrapper()
 
     async def ingest_data(self, topic: str, csv_content: bytes):
-        """Gửi dữ liệu CSV lớn lên Kafka theo từng bản ghi"""
+        """Gửi dữ liệu lên Kafka"""
         from io import StringIO
         queries = pd.read_csv(StringIO(csv_content.decode('utf-8')))
         for _, row in queries.iterrows():
