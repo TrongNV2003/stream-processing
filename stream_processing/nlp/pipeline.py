@@ -1,28 +1,96 @@
 import time
 import torch
-import onnxruntime
+from abc import ABC
+from loguru import logger
+from optimum.onnxruntime import ORTModel
 from datetime import datetime, timezone
 from prometheus_client import Counter, Histogram
-from transformers import AutoTokenizer, AutoModelForSequenceClassification
+from typing import Optional, Any, Union, Tuple
+from transformers import PreTrainedTokenizer, AutoConfig, AutoTokenizer
 
 from stream_processing.nlp.data_loader import DataLoader
-from stream_processing.setting.constants import ATTACKID2LABEL
 from stream_processing.logging.logging_monitor import AppLogger
 from stream_processing.modules.kafka_consumer import create_consumer
 from stream_processing.modules.kafka_producer import KafkaProducerWrapper
-from stream_processing.setting.config import kafka_config, attack_model_config
+from stream_processing.setting.config import kafka_config, model_config
+from stream_processing.setting.common import Device, Engine
+from stream_processing.nlp.engine.model_loader import ModelLoaderFactory
+from stream_processing.utils.huggingface_util import load_model_from_huggingface
 
 app_logger = AppLogger.get_instance()
 
-class NetworkInferenceProcessor:
-    def __init__(self, use_torch=False, processing_mode="streaming", batch_size=8, batch_timeout=0.1):
+class BaseInference(ABC):
+    def __init__(
+        self,
+        local_dir: str,
+        huggingface_repo_id: str,
+        device: Optional[Device] = None,
+        engine: Optional[Engine] = None,    
+    ):
+        self.device = torch.device(device) if device else torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        self.engine = engine or Engine.TORCH
+        
+        self.model, self.tokenizer, self.sess_output, self.config = self.from_pretrained(
+            local_dir=local_dir,
+            huggingface_repo_id=huggingface_repo_id,
+        )
+        
+    def from_pretrained(
+        self,
+        local_dir: str,
+        huggingface_repo_id: str,
+        **kwargs,
+    ) -> Tuple[Union[torch.nn.Module, ORTModel], PreTrainedTokenizer, Any, AutoConfig]:
         """
+        Load the model from the specified directory or Hugging Face repository.
+        
         Args:
-            use_torch (bool): Use PyTorch model if True, ONNX if False.
-            processing_mode (str): Processing mode, either "streaming" or "micro_batch".
-            batch_size (int): Maximum number of messages in a micro-batch.
-            batch_timeout (float): Maximum time (in seconds) to wait for a micro-batch.
+            local_dir (str): Local directory to load the model from.
+            huggingface_repo_id (str): Hugging Face repository ID.
+            num_labels (int): Number of labels for classification.
+            engine (Engine): Engine type (ONNX or Torch).
+        
+        Returns:
+            Tuple[Union[torch.nn.Module, ORTModel], Any, Any]: Loaded model, tokenizer, and session output.
         """
+        logger.info(f"Loading model on {self.device} - Engine: {self.engine}")
+        local_model_path = load_model_from_huggingface(local_dir, huggingface_repo_id)
+        
+        config = AutoConfig.from_pretrained(local_model_path)
+        if not hasattr(config, "id2label") or not config.id2label:
+            raise ValueError("Model config does not contain id2label")
+        
+        tokenizer = AutoTokenizer.from_pretrained(local_model_path, use_fast=True)
+        model_loader = ModelLoaderFactory.get_model_loader(self.engine)
+        model = model_loader.load_model(local_model_path, config, self.device)
+        
+        sess_output = None
+        if self.engine == Engine.ONNX:
+            sess_output = [out.name for out in model.get_outputs()]
+        
+        return model, tokenizer, sess_output, config
+    
+class NetworkInference(BaseInference, ABC):
+    """
+    Args:
+        use_torch (bool): Use PyTorch model if True, ONNX if False.
+        processing_mode (str): Processing mode, either "streaming" or "micro_batch".
+        batch_size (int): Maximum number of messages in a micro-batch.
+        batch_timeout (float): Maximum time (in seconds) to wait for a micro-batch.
+    """
+    def __init__(
+        self,
+        local_dir: str,
+        huggingface_repo_id: str,
+        device: Optional[Device] = None,
+        engine: Optional[Engine] = None,
+        use_torch=True,
+        processing_mode="micro_batch",
+        batch_size=8,
+        batch_timeout=0.1
+    ):
+        super().__init__(local_dir, huggingface_repo_id, device, engine)
+        
         self.use_torch = use_torch
         self.processing_mode = processing_mode
         self.batch_size = batch_size
@@ -33,27 +101,16 @@ class NetworkInferenceProcessor:
         self.latency_histogram = Histogram('processing_latency_seconds', 'Latency of processing messages')
         self.attack_counter = Counter('detected_attacks_total', 'Total detected attacks')
 
-        self.tokenizer = AutoTokenizer.from_pretrained(attack_model_config.tokenizer_path)
         self.dataloader = DataLoader()
         
         self.consumer = create_consumer(kafka_config.raw_data_topic, group_id="network_inference_group") 
         self.producer = KafkaProducerWrapper()
         self.session_id = f"session_{datetime.now().timestamp()}"
         
-        if self.use_torch:
-            self.model = AutoModelForSequenceClassification.from_pretrained(
-                attack_model_config.pytorch_model_path,
-                num_labels=len(ATTACKID2LABEL)
-            )
-            self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-            self.model.to(self.device)
-            self.model.eval()
-        else:
-            self.session = onnxruntime.InferenceSession(
-                attack_model_config.onnx_model_path,
-                providers=["CUDAExecutionProvider"] if torch.cuda.is_available() else ["CPUExecutionProvider"]
-            )
-            self.sess_output = [out.name for out in self.session.get_outputs()]
+        self.model, self.tokenizer, self.sess_output, self.config = self.from_pretrained(
+            local_dir=local_dir,
+            huggingface_repo_id=huggingface_repo_id
+        )
         
     def process_stream(self):
         """
@@ -76,15 +133,15 @@ class NetworkInferenceProcessor:
         Process messages in pure streaming mode (one message at a time).
         """
         for message in self.consumer:
-            try:
-                data = message.value
-                if not isinstance(data, dict):
-                    app_logger.log(f"Invalid message data: {data} is not a dictionary", level="error")
-                    continue
-                input_text = self.dataloader.build_context(data, self.tokenizer.sep_token)
-                self._process_query([input_text], [data])
-            except Exception as e:
-                app_logger.log(f"Error processing message: {str(e)}", level="error")
+            # try:
+            data = message.value
+            if not isinstance(data, dict):
+                app_logger.log(f"Invalid message data: {data} is not a dictionary", level="error")
+                continue
+            input_text = self.dataloader.build_context(data, self.tokenizer.sep_token)
+            self._process_query([input_text], [data])
+            # except Exception as e:
+            #     app_logger.log(f"Error processing message: {str(e)}", level="error")
 
     def _process_micro_batch(self):
         """
@@ -154,7 +211,7 @@ class NetworkInferenceProcessor:
                 "input_ids": inputs["input_ids"].cpu().numpy(),
                 "attention_mask": inputs["attention_mask"].cpu().numpy()
             }
-            outputs = self.session.run(self.sess_output, sess_input)
+            outputs = self.model.run(self.sess_output, sess_input)
             logits = torch.from_numpy(outputs[0])
             preds = torch.argmax(logits, dim=1).cpu().numpy().tolist()
             confidences = torch.softmax(logits, dim=1)[range(len(preds)), preds].cpu().numpy().tolist()
@@ -170,10 +227,10 @@ class NetworkInferenceProcessor:
         end_time_iso = datetime.fromtimestamp(end_time).isoformat()
 
         results = []
-        attack_labels = ["DDoS attacks", "DoS attacks", "Bot"]
+        attack_labels = [label for label in self.config.id2label.values() if label != "Benign"]
 
         for i, (data, input_text, pred, confidence) in enumerate(zip(datas, input_texts, preds, confidences)):
-            predicted_label = ATTACKID2LABEL[pred]
+            predicted_label = self.config.id2label[pred]
 
             result = {
                 "id": data.get("id"),

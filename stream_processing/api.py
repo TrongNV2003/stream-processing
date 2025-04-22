@@ -19,7 +19,7 @@ async def ingest_in_background(content: bytes):
 
 @app.post("/ingest")
 async def ingest(background_tasks: BackgroundTasks):
-    with open("stream_processing/data_test_stream/dataset.csv", "rb") as file:
+    with open("stream_processing/data_test_stream/test_dataset.csv", "rb") as file:
         content = file.read()
         
     background_tasks.add_task(ingest_in_background, content) # Chạy trong background
